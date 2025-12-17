@@ -1,0 +1,7 @@
+aggregated_queries:
+    enabled: true
+    debug: '%kernel.debug%'
+    max_relations: 15
+    default_hydrator: 'array'
+    fallback_enabled: false
+

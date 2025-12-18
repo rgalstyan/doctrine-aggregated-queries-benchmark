@@ -21,6 +21,7 @@ final class PerformanceTestCommand extends Command
 {
     private const DEFAULT_LIMIT = 500;
     private const MAX_LIMIT = 2000;
+    private const DEFAULT_WARMUP = 1;
     private const IMAGES_PER_PRODUCT = 3;
     private const REVIEWS_PER_PRODUCT = 5;
 
@@ -41,20 +42,32 @@ final class PerformanceTestCommand extends Command
             'Number of products to load',
             self::DEFAULT_LIMIT
         );
+
+        $this->addOption(
+            'warmup',
+            'w',
+            InputOption::VALUE_OPTIONAL,
+            'Warmup rounds (not measured) to reduce cold-cache bias',
+            self::DEFAULT_WARMUP
+        );
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
         $limit = $this->prepareLimit($input);
+        $warmupRounds = $this->prepareWarmupRounds($input);
 
         $this->printHeader($output, $limit);
+
+        $this->warmUp($output, $limit, $warmupRounds);
 
         $traditional = $this->measureTraditional($output, $limit);
         $doctrineJoinFetch = $this->measureDoctrineJoinFetch($output, $limit);
         $simpleJoins = $this->measureSimpleJoins($output, $limit);
         $aggregated = $this->measureAggregated($output, $limit);
+        $joinPhpGrouping = $this->measureJoinPhpGroupingStructuredArrays($output, $limit);
 
-        $this->printComparison($output, $traditional, $doctrineJoinFetch, $simpleJoins, $aggregated);
+        $this->printComparison($output, $traditional, $doctrineJoinFetch, $simpleJoins, $aggregated, $joinPhpGrouping);
 
         return Command::SUCCESS;
     }
@@ -204,12 +217,61 @@ final class PerformanceTestCommand extends Command
         return new PerformanceResult($duration, $memoryBytes, $queries, $resultCount, $resultCount);
     }
 
+    private function measureJoinPhpGroupingStructuredArrays(OutputInterface $output, int $limit): PerformanceResult
+    {
+        $output->writeln("\n<comment>JOIN + PHP GROUPING (structured arrays) ({$limit} records)</comment>");
+        $output->writeln(str_repeat('━', 50));
+
+        $this->entityManager->clear();
+        $this->queryCounter->reset();
+        gc_collect_cycles();
+
+        $memoryBefore = memory_get_usage(false);
+        if (function_exists('memory_reset_peak_usage')) {
+            memory_reset_peak_usage();
+        }
+        $startTime = microtime(true);
+
+        $rows = $this->productRepository->findAllWithSimpleJoinsFlat($limit);
+        $rowsProcessed = count($rows);
+
+        $result = $this->groupSimpleJoinFlatRowsToAggregatedShape($rows);
+        $resultCount = count($result);
+
+        $duration = round((microtime(true) - $startTime) * 1000, 2);
+        $memoryBytes = max(0, memory_get_usage(false) - $memoryBefore);
+        $peakMemoryBytes = memory_get_peak_usage(false);
+        $queries = $this->queryCounter->getCount();
+
+        unset($rows, $result);
+        $this->entityManager->clear();
+        gc_collect_cycles();
+
+        $output->writeln("Time:    {$duration}ms");
+        $output->writeln(sprintf(
+            'Memory:  %s KB (%.2f MB)',
+            $this->formatKilobytes($memoryBytes),
+            $memoryBytes / 1024 / 1024
+        ));
+        $output->writeln(sprintf(
+            'Peak:    %s KB (%.2f MB)',
+            $this->formatKilobytes($peakMemoryBytes),
+            $peakMemoryBytes / 1024 / 1024
+        ));
+        $output->writeln("Queries: {$queries}");
+        $output->writeln("DB rows: {$rowsProcessed} (flat JOIN result set processed)");
+        $output->writeln("Result:  {$resultCount} products (structured arrays)");
+
+        return new PerformanceResult($duration, $memoryBytes, $queries, $rowsProcessed, $resultCount);
+    }
+
     private function printComparison(
         OutputInterface $output,
         PerformanceResult $traditional,
         PerformanceResult $doctrineJoinFetch,
         PerformanceResult $simpleJoins,
-        PerformanceResult $aggregated
+        PerformanceResult $aggregated,
+        PerformanceResult $joinPhpGrouping,
     ): void {
         $lineLength = 99;
 
@@ -273,6 +335,17 @@ final class PerformanceTestCommand extends Command
             (int) ($aggregated->resultCount ?? 0),
         ));
 
+        $output->writeln(sprintf(
+            "%-26s | %-8s | %10.2f | %12s | %7d | %10d | %8d",
+            '5) JOIN + PHP grouping',
+            'arrays',
+            $joinPhpGrouping->timeMs,
+            $this->formatKilobytes($joinPhpGrouping->memoryBytes),
+            $joinPhpGrouping->queryCount,
+            (int) ($joinPhpGrouping->rowsReturned ?? 0),
+            (int) ($joinPhpGrouping->resultCount ?? 0),
+        ));
+
         $output->writeln(str_repeat('━', $lineLength));
 
         $output->writeln("\n" . str_repeat('━', $lineLength));
@@ -282,6 +355,7 @@ final class PerformanceTestCommand extends Command
         $this->printImprovementAgainst($output, 'Traditional', $traditional, $aggregated);
         $this->printImprovementAgainst($output, 'Doctrine JOIN fetch', $doctrineJoinFetch, $aggregated);
         $this->printImprovementAgainst($output, 'Simple JOINs', $simpleJoins, $aggregated);
+        $this->printImprovementAgainst($output, 'JOIN + PHP grouping', $joinPhpGrouping, $aggregated);
 
         $timeImprovementVsTraditional = $this->calculateImprovement($traditional->timeMs, $aggregated->timeMs);
         if ($timeImprovementVsTraditional > 70) {
@@ -411,6 +485,41 @@ final class PerformanceTestCommand extends Command
         return max(1, min($limit, self::MAX_LIMIT));
     }
 
+    private function prepareWarmupRounds(InputInterface $input): int
+    {
+        $warmup = (int) $input->getOption('warmup');
+
+        return max(0, $warmup);
+    }
+
+    private function warmUp(OutputInterface $output, int $limit, int $rounds): void
+    {
+        if ($rounds <= 0) {
+            return;
+        }
+
+        $output->writeln(sprintf(
+            "\n<comment>WARMUP (%dx) - stabilizing DB cache to avoid order bias</comment>",
+            $rounds
+        ));
+
+        for ($i = 0; $i < $rounds; ++$i) {
+            $this->entityManager->clear();
+            $this->queryCounter->reset();
+            gc_collect_cycles();
+
+            $rows = $this->productRepository->findAllWithSimpleJoinsFlat($limit);
+            $result = $this->groupSimpleJoinFlatRowsToAggregatedShape($rows);
+            unset($rows, $result);
+
+            $result = $this->productRepository->findAllAggregated($limit);
+            unset($result);
+
+            $this->entityManager->clear();
+            gc_collect_cycles();
+        }
+    }
+
     private function printHeader(OutputInterface $output, int $limit): void
     {
         $output->writeln(str_repeat('━', 50));
@@ -422,6 +531,85 @@ final class PerformanceTestCommand extends Command
     private function formatKilobytes(int $bytes): string
     {
         return number_format($bytes / 1024, 1, '.', '');
+    }
+
+    /**
+     * Convert a flat Cartesian product result-set into the same structure as the JSON aggregation output.
+     *
+     * @param list<array<string, mixed>> $rows
+     * @return list<array<string, mixed>>
+     */
+    private function groupSimpleJoinFlatRowsToAggregatedShape(array $rows): array
+    {
+        $products = [];
+        $imagesSeen = [];
+        $reviewsSeen = [];
+
+        foreach ($rows as $row) {
+            $productIdKey = (string) $row['product_id'];
+
+            if (!isset($products[$productIdKey])) {
+                $products[$productIdKey] = [
+                    'id' => $row['product_id'],
+                    'name' => $row['product_name'],
+                    'description' => $row['product_description'],
+                    'price' => $row['product_price'],
+                    'stock' => $row['product_stock'],
+                    'created_at' => $row['product_created_at'],
+                    'updated_at' => $row['product_updated_at'],
+                    'category_id' => $row['category_id'],
+                    'brand_id' => $row['brand_id'],
+                    'category' => $row['category_id'] !== null ? [
+                        'id' => (int) $row['category_id'],
+                        'name' => $row['category_name'],
+                        'slug' => $row['category_slug'],
+                    ] : null,
+                    'brand' => $row['brand_id'] !== null ? [
+                        'id' => (int) $row['brand_id'],
+                        'name' => $row['brand_name'],
+                        'country' => $row['brand_country'],
+                    ] : null,
+                    'images' => [],
+                    'reviews' => [],
+                    'images_count' => 0,
+                    'reviews_count' => 0,
+                ];
+
+                $imagesSeen[$productIdKey] = [];
+                $reviewsSeen[$productIdKey] = [];
+            }
+
+            $imageId = $row['image_id'];
+            if ($imageId !== null) {
+                $imageIdKey = (string) $imageId;
+                if (!isset($imagesSeen[$productIdKey][$imageIdKey])) {
+                    $products[$productIdKey]['images'][] = [
+                        'id' => (int) $imageId,
+                        'url' => $row['image_url'],
+                        'position' => (int) $row['image_position'],
+                    ];
+                    $imagesSeen[$productIdKey][$imageIdKey] = true;
+                    ++$products[$productIdKey]['images_count'];
+                }
+            }
+
+            $reviewId = $row['review_id'];
+            if ($reviewId !== null) {
+                $reviewIdKey = (string) $reviewId;
+                if (!isset($reviewsSeen[$productIdKey][$reviewIdKey])) {
+                    $products[$productIdKey]['reviews'][] = [
+                        'id' => (int) $reviewId,
+                        'author' => $row['review_author'],
+                        'rating' => (int) $row['review_rating'],
+                        'comment' => $row['review_comment'],
+                    ];
+                    $reviewsSeen[$productIdKey][$reviewIdKey] = true;
+                    ++$products[$productIdKey]['reviews_count'];
+                }
+            }
+        }
+
+        return array_values($products);
     }
 }
 

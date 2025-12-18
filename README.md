@@ -2,7 +2,7 @@
 
 This is a small Symfony + Doctrine + PostgreSQL benchmark project designed to demonstrate the performance benefits of [`rgalstyan/symfony-aggregated-queries`](https://github.com/rgalstyan/symfony-aggregated-queries).
 
-It compares four common approaches for a “product catalog listing” with relations:
+It compares five common approaches for a “product catalog listing” with relations:
 
 1) **Traditional Doctrine ORM**
    - Entities + joins for `ManyToOne`
@@ -24,6 +24,11 @@ It compares four common approaches for a “product catalog listing” with rela
    - Relations/collections/counts are aggregated in SQL (JSON)
    - Returns arrays (DTO-style, no entity hydration)
 
+5) **JOIN + PHP grouping (structured arrays)**
+   - Same JOIN-based query (no JSON aggregation)
+   - Flat result-set is grouped/deduplicated in PHP to build the same nested structure as JSON aggregation
+   - Returns arrays (DTO-style, no entity hydration)
+
 > This benchmark focuses on **read-only listing queries** (arrays/DTOs). It does not measure writes, lifecycle events, lazy-loading, etc.
 
 ## What the code does
@@ -34,6 +39,7 @@ The benchmark lives in:
   - `findAllTraditional(int $limit)`
   - `findAllWithDoctrineJoinFetch(int $limit)`
   - `findAllWithSimpleJoins(int $limit)`
+  - `findAllWithSimpleJoinsFlat(int $limit)`
   - `findAllAggregated(int $limit)`
 - Command: `src/Command/PerformanceTestCommand.php`
 
@@ -135,6 +141,10 @@ php bin/console doctrine:fixtures:load --no-interaction
 # default is 500 (max is 2000)
 php bin/console app:performance-test
 php bin/console app:performance-test --limit=1000
+
+# optional: warmup rounds to reduce cold-cache bias (default is 1)
+php bin/console app:performance-test --warmup=0
+php bin/console app:performance-test --warmup=2
 ```
 
 ## Interpreting the output

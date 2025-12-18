@@ -182,6 +182,61 @@ class ProductRepository extends ServiceEntityRepository
         return $this->deduplicateCartesianProduct($rows);
     }
 
+    /**
+     * Fetch products using the same simple JOINs query, but return the flat Cartesian-product rows.
+     *
+     * @return list<array<string, mixed>>
+     */
+    public function findAllWithSimpleJoinsFlat(int $limit): array
+    {
+        $sql = <<<'SQL'
+            SELECT
+                p.id AS product_id,
+                p.name AS product_name,
+                p.description AS product_description,
+                p.price AS product_price,
+                p.stock AS product_stock,
+                p.created_at AS product_created_at,
+                p.updated_at AS product_updated_at,
+
+                c.id AS category_id,
+                c.name AS category_name,
+                c.slug AS category_slug,
+
+                b.id AS brand_id,
+                b.name AS brand_name,
+                b.country AS brand_country,
+
+                i.id AS image_id,
+                i.url AS image_url,
+                i.position AS image_position,
+
+                r.id AS review_id,
+                r.author AS review_author,
+                r.rating AS review_rating,
+                r.comment AS review_comment
+            FROM products p
+            LEFT JOIN categories c ON p.category_id = c.id
+            LEFT JOIN brands b ON p.brand_id = b.id
+            LEFT JOIN product_images i ON i.product_id = p.id
+            LEFT JOIN product_reviews r ON r.product_id = p.id
+            WHERE p.id IN (
+                SELECT id FROM products ORDER BY id ASC LIMIT :limit
+            )
+            ORDER BY p.id ASC, i.position ASC, r.created_at DESC
+            SQL;
+
+        $rows = $this->getEntityManager()->getConnection()->executeQuery(
+            $sql,
+            ['limit' => $limit],
+            ['limit' => ParameterType::INTEGER],
+        )->fetchAllAssociative();
+
+        $this->lastSimpleJoinsRowCount = count($rows);
+
+        return $rows;
+    }
+
     public function getLastSimpleJoinsRowCount(): int
     {
         return $this->lastSimpleJoinsRowCount;
